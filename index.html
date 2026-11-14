@@ -902,10 +902,23 @@ function show(v){
 var Days = store.get('kad-days', {});        // { '2026-11-18': { Maternelle:{par,heure,presents,total}, … } }
 var StCache = store.get('kad-st', {});       // { '2026-11-18|Maternelle': { idÉlève:'P'|'A', … } }
 var Outbox = store.get('kad-outbox', []);    // appels pas encore confirmés par Google
+var DaysFrom = store.get('kad-daysfrom', null);   // Google a envoyé tous les mercredis : Days est complet à partir de cette date
+function saveAllDays(all){
+  var keys = Object.keys(all).sort().reverse().slice(0, 60);
+  Days = {}; keys.forEach(function(k){ Days[k] = all[k]; });
+  DaysFrom = keys.length === Object.keys(all).length ? '0000-00-00' : keys[keys.length - 1];
+  store.set('kad-days', Days); store.set('kad-daysfrom', DaysFrom);
+}
+/* Ce qu'on sait d'un mercredi sans demander à Google (null = on ne sait pas). */
+function knownDay(date){
+  if (Days[date]) return Days[date];
+  return DaysFrom && date >= DaysFrom ? {} : null;
+}
 function saveDay(date, today){
   Days[date] = today || {};
   var keys = Object.keys(Days).sort();
-  while (keys.length > 30) delete Days[keys.shift()];
+  while (keys.length > 60) delete Days[keys.shift()];
+  if (DaysFrom && DaysFrom < keys[0] && keys.length === 60){ DaysFrom = keys[0]; store.set('kad-daysfrom', DaysFrom); }
   store.set('kad-days', Days);
 }
 function saveSt(date, classe, st){
@@ -924,8 +937,10 @@ function refresh(){
   var session = S.session;
   return api('home', {date:session}).then(function(r){
     S.students = r.students || []; S.removed = r.removed || [];
+    if (r.days) saveAllDays(r.days);   // tous les mercredis d'un coup : les flèches n'ont plus rien à attendre
     saveDay(session, r.today || {});
-    if (session === S.session){ S.today = withPending(session, r.today); S.todayLoading = false; }   // on a pu changer de mercredi entre-temps
+    if (session === S.session){ S.today = withPending(session, r.today); S.todayLoading = false; }
+    else if (S.todayLoading && knownDay(S.session)){ S.today = withPending(S.session, knownDay(S.session)); S.todayLoading = false; }   // on a changé de mercredi entre-temps
     S.recent = r.recent || []; S.links = r.links || null; S.loaded = true;
     // Copie gardée sur le téléphone : l'appli s'affiche tout de suite à la prochaine ouverture
     if (LIVE) store.set('kad-cache', {students:S.students, removed:S.removed, recent:S.recent, links:S.links, session:session, today:S.today});
@@ -978,7 +993,7 @@ function afterSync(){
   if (!LIVE || bgBusy) return;
   var jobs = [];
   var d = defaultSession();
-  for (var i = 0; i < 4; i++){ var w = addDays(d, -7 * i); if (w !== S.session && !bgDone['d' + w]) jobs.push({day:w}); }
+  if (!DaysFrom) for (var i = 0; i < 6; i++){ var w = addDays(d, -7 * i); if (w !== S.session && !bgDone['d' + w]) jobs.push({day:w}); }
   [S.session].concat(Object.keys(Days).sort().reverse().slice(0, 4)).forEach(function(date){
     Object.keys(Days[date] || {}).forEach(function(c){
       var k = date + '|' + c;
@@ -987,15 +1002,30 @@ function afterSync(){
   });
   if (!jobs.length) return;
   bgBusy = true;
-  (function next(){
-    var j = jobs.shift();
-    if (!S.pin){ bgBusy = false; return; }
-    if (!j){ bgBusy = false; afterSync(); return; }   // les mercredis chargés peuvent révéler des classes déjà faites
+  var running = 0;
+  // 3 demandes à la fois (Google répond en parallèle) au lieu d'une par une
+  function pump(){
+    if (!S.pin) jobs = [];
+    while (running < 3 && jobs.length) run(jobs.shift());
+    if (!running && !jobs.length){ bgBusy = false; if (S.pin) afterSync(); }   // les mercredis chargés peuvent révéler des classes déjà faites
+  }
+  function run(j){
+    running++;
     var p;
-    if (j.day){ bgDone['d' + j.day] = 1; p = api('home', {date:j.day}).then(function(r){ saveDay(j.day, r.today || {}); }); }
-    else { bgDone['s' + j.date + '|' + j.classe] = 1; p = api('todayStatuses', {classe:j.classe, date:j.date}).then(function(r){ saveSt(j.date, j.classe, r.statuses || {}); }); }
-    p.catch(function(){}).then(next);
-  })();
+    if (j.day){
+      bgDone['d' + j.day] = 1;
+      p = api('home', {date:j.day}).then(function(r){
+        if (r.days) saveAllDays(r.days);
+        saveDay(j.day, r.today || {});
+        if (S.session === j.day && S.todayLoading){ S.today = withPending(j.day, r.today); S.todayLoading = false; if (S.view === 'home') renderHome(); }
+      });
+    } else {
+      bgDone['s' + j.date + '|' + j.classe] = 1;
+      p = api('todayStatuses', {classe:j.classe, date:j.date}).then(function(r){ saveSt(j.date, j.classe, r.statuses || {}); });
+    }
+    p.catch(function(){}).then(function(){ running--; pump(); });
+  }
+  pump();
 }
 
 /* ---------- Envoi des appels : l'écran confirme tout de suite, Google est prévenu en arrière-plan ---------- */
@@ -1059,7 +1089,7 @@ function lock(msg){
   for (var k in photoCache) delete photoCache[k];
   for (var q in pendingPh) delete pendingPh[q];
   phQueue = []; phTries = {};
-  Days = {}; StCache = {}; bgDone = {}; store.del('kad-days'); store.del('kad-st');
+  Days = {}; StCache = {}; bgDone = {}; DaysFrom = null; store.del('kad-days'); store.del('kad-st'); store.del('kad-daysfrom');
   S.pin = ''; S.name = ''; S.loaded = false; S.students = []; S.removed = [];
   startLogin(msg);
 }
@@ -1127,12 +1157,19 @@ function moveSession(k){
   if (nx > defaultSession()) return;
   // Affichage immédiat depuis la mémoire du téléphone, puis vérification discrète auprès de Google
   S.session = nx;
-  var known = LIVE ? Days[nx] : null;
+  var known = LIVE ? knownDay(nx) : null;
   S.today = withPending(nx, known || {}); S.todayLoading = LIVE && !known;
   renderHome();
-  if (LIVE) sync().catch(function(e){ if (S.todayLoading){ S.todayLoading = false; renderHome(); } handleErr(e); });
-  else refresh().then(renderHome).catch(handleErr);
+  if (!LIVE){ refresh().then(renderHome).catch(handleErr); return; }
+  // Vérification auprès de Google seulement quand on s'arrête sur un mercredi (pas à chaque flèche),
+  // et pas du tout si tout a été mis à jour il y a moins d'une minute.
+  clearTimeout(moveTimer);
+  if (known && Date.now() - lastSync < 60000) return;
+  moveTimer = setTimeout(function(){
+    sync().catch(function(e){ if (S.todayLoading){ S.todayLoading = false; renderHome(); } handleErr(e); });
+  }, known ? 1500 : 300);
 }
+var moveTimer = null;
 function openClass(classe){
   var list = S.students.filter(function(s){ return s.classe === classe; });
   if (!list.length){ toast('Aucun élève en ' + classe + '. Ajoutes-en dans l’onglet Élèves.'); return; }

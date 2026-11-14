@@ -1,7 +1,7 @@
 // Kad'Swipe : la page, les icônes et les polices sont gardées sur le téléphone.
 // À chaque ouverture : affichage immédiat depuis le téléphone, puis mise à jour discrète en arrière-plan
 // (une nouvelle version de l'appli apparaît donc à l'ouverture suivante).
-var CACHE = 'kadswipe-3e9f661d5b';
+var CACHE = 'kadswipe-icone-swipe-1';
 var SHELL = ['./', 'index.html', 'manifest.webmanifest', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
 self.addEventListener('install', function(e){
   e.waitUntil(caches.open(CACHE).then(function(c){ return c.addAll(SHELL); }).then(function(){ return self.skipWaiting(); }));

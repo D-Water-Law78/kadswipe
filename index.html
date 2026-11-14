@@ -915,11 +915,31 @@ function loadCached(){
   S.loaded = true;
   prefetchPhotos();
 }
+/* Quand la liste à jour arrive de Google : on redessine l'écran affiché (accueil, élèves ou fiche),
+   sans toucher à un appel en cours ni à un formulaire en train d'être rempli. */
+function redrawCurrent(){
+  if (S.view === 'home') renderHome();
+  else if (S.view === 'eleves') renderEleves();
+  else if (S.view === 'profile') renderProfile();
+}
+var lastSync = 0, syncing = false;
+function sync(){
+  if (syncing) return Promise.resolve();
+  syncing = true;
+  return refresh().then(function(){ lastSync = Date.now(); redrawCurrent(); })
+    .then(function(){ syncing = false; }, function(e){ syncing = false; throw e; });
+}
 function goHome(){
   loadCached();
   show('home'); renderHome();
-  refresh().then(function(){ if (S.view === 'home') renderHome(); }).catch(handleErr);
+  sync().catch(handleErr);
 }
+/* L'appli revient au premier plan (iPhone : elle n'est pas rechargée) : on redemande la liste à Google. */
+document.addEventListener('visibilitychange', function(){
+  if (document.visibilityState !== 'visible' || !S.pin || !LIVE) return;
+  if (Date.now() - lastSync < 15000) return;
+  sync().catch(function(){});
+});
 
 /* ---------- Connexion : chaque serviteur a son code personnel ---------- */
 var pinBuf = '';

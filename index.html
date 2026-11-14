@@ -2,7 +2,7 @@
 <html lang="fr">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>Kad'Swipe</title>
 <meta name="robots" content="noindex, nofollow">
 <meta name="theme-color" content="#6E2721">
@@ -57,6 +57,9 @@
 }
 *,*::before,*::after{box-sizing:border-box}
 html,body{height:100%}
+/* Comme une vraie appli : pas de zoom (pincer ou double-tap), pas de grossissement auto du texte */
+html{touch-action:pan-x pan-y;-webkit-text-size-adjust:100%;text-size-adjust:100%}
+button,a,label{touch-action:manipulation;-webkit-user-select:none;user-select:none}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 var(--font-body);-webkit-font-smoothing:antialiased;-webkit-tap-highlight-color:transparent;overscroll-behavior:none;transition:background .25s}
 body.brand{background:var(--brand);color:var(--brand-ink)}
 button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer}
@@ -685,17 +688,63 @@ function avatar(s, size){
   var inner = s.photo ? imgTag(s.photo) : esc(initials(s));
   return '<span class="av lv-' + lvOf(s.classe) + '" style="width:' + size + 'px;height:' + size + 'px;font-size:' + Math.round(size*.36) + 'px">' + inner + '</span>';
 }
+/* Photos gardées sur le téléphone (IndexedDB) : téléchargées une seule fois.
+   Une photo modifiée a un nouvel identifiant, donc elle est retéléchargée toute seule. */
+var PhotoDB = (function(){
+  var dbp = null;
+  function open(){
+    if (!dbp) dbp = new Promise(function(res){
+      try {
+        var r = indexedDB.open('kadswipe', 1);
+        r.onupgradeneeded = function(){ r.result.createObjectStore('photos'); };
+        r.onsuccess = function(){ res(r.result); };
+        r.onerror = function(){ res(null); };
+      } catch(e){ res(null); }
+    });
+    return dbp;
+  }
+  return {
+    getMany: function(keys){
+      return open().then(function(db){
+        if (!db || !keys.length) return {};
+        return new Promise(function(res){
+          var out = {};
+          try {
+            var tx = db.transaction('photos', 'readonly'), st = tx.objectStore('photos');
+            keys.forEach(function(k){ var q = st.get(k); q.onsuccess = function(){ if (q.result) out[k] = q.result; }; });
+            tx.oncomplete = function(){ res(out); }; tx.onerror = function(){ res(out); };
+          } catch(e){ res(out); }
+        });
+      });
+    },
+    put: function(map){
+      open().then(function(db){
+        if (!db) return;
+        try { var st = db.transaction('photos', 'readwrite').objectStore('photos'); Object.keys(map).forEach(function(k){ if (map[k]) st.put(map[k], k); }); } catch(e){}
+      });
+    },
+    clear: function(){ open().then(function(db){ if (db) try { db.transaction('photos', 'readwrite').objectStore('photos').clear(); } catch(e){} }); }
+  };
+})();
 function loadPhotos(keys){
   if (!LIVE) return;
   var seen = {}, miss = [];
   keys.forEach(function(k){ if (k && !seen[k] && !(k in photoCache) && !pendingPh[k]) { seen[k] = 1; miss.push(k); } });
-  for (var i = 0; i < miss.length; i += 4) (function(chunk){
-    chunk.forEach(function(k){ pendingPh[k] = 1; });
-    api('photos', {ids: chunk}).then(function(map){
-      chunk.forEach(function(k){ delete pendingPh[k]; photoCache[k] = (map && map[k]) || null; });
-      applyPhotos();
-    }).catch(function(){ chunk.forEach(function(k){ delete pendingPh[k]; }); });
-  })(miss.slice(i, i+4));
+  if (!miss.length) return;
+  miss.forEach(function(k){ pendingPh[k] = 1; });
+  PhotoDB.getMany(miss).then(function(local){
+    var net = [];
+    miss.forEach(function(k){ if (local[k]){ photoCache[k] = local[k]; delete pendingPh[k]; } else net.push(k); });
+    applyPhotos();
+    for (var i = 0; i < net.length; i += 4) (function(chunk){
+      api('photos', {ids: chunk}).then(function(map){
+        var keep = {};
+        chunk.forEach(function(k){ delete pendingPh[k]; photoCache[k] = (map && map[k]) || null; if (photoCache[k]) keep[k] = photoCache[k]; });
+        PhotoDB.put(keep);
+        applyPhotos();
+      }).catch(function(){ chunk.forEach(function(k){ delete pendingPh[k]; }); });
+    })(net.slice(i, i+4));
+  });
 }
 function applyPhotos(){
   $$('img[data-ph]:not([src])').forEach(function(img){ var v = photoCache[img.getAttribute('data-ph')]; if (v) img.src = v; });
@@ -800,12 +849,24 @@ function show(v){
   var sc = $('#v-' + v + ' .scroll'); if (sc) sc.scrollTop = 0;
 }
 function refresh(){
-  return api('home', {date:S.session}).then(function(r){
+  var session = S.session;
+  return api('home', {date:session}).then(function(r){
     S.students = r.students || []; S.removed = r.removed || []; S.today = r.today || {};
     S.recent = r.recent || []; S.links = r.links || null; S.loaded = true;
+    // Copie gardée sur le téléphone : l'appli s'affiche tout de suite à la prochaine ouverture
+    if (LIVE) store.set('kad-cache', {students:S.students, removed:S.removed, recent:S.recent, links:S.links, session:session, today:S.today});
   });
 }
+function loadCached(){
+  if (!LIVE || S.loaded) return;
+  var c = store.get('kad-cache', null);
+  if (!c || !c.students) return;
+  S.students = c.students; S.removed = c.removed || []; S.recent = c.recent || []; S.links = c.links || null;
+  S.today = c.session === S.session ? (c.today || {}) : {};
+  S.loaded = true;
+}
 function goHome(){
+  loadCached();
   show('home'); renderHome();
   refresh().then(function(){ if (S.view === 'home') renderHome(); }).catch(handleErr);
 }
@@ -842,7 +903,13 @@ function checkPin(){
     $('#pin-err').textContent = /code incorrect/i.test(e.message) ? 'Code inconnu, réessaie.' : e.message;
   }).then(function(){ S.pinBusy = false; });
 }
-function lock(msg){ store.del('kad-auth'); S.pin = ''; S.name = ''; S.loaded = false; startLogin(msg); }
+function lock(msg){
+  // Déconnexion : on efface aussi la copie des élèves et des photos gardée sur ce téléphone
+  store.del('kad-auth'); store.del('kad-cache'); if (LIVE) PhotoDB.clear();
+  for (var k in photoCache) delete photoCache[k];
+  S.pin = ''; S.name = ''; S.loaded = false; S.students = []; S.removed = [];
+  startLogin(msg);
+}
 function renderUser(){ $('#user-name').textContent = S.name; $('#user-dot').textContent = (S.name[0] || '?').toUpperCase(); }
 function openUser(){
   openSheet('<h3>' + esc(S.name) + '</h3><p style="margin:0;color:var(--muted)">Chaque serviteur a son propre code : ton nom est noté automatiquement à chaque appel, ajout, modification ou retrait d’élève.</p>' +
@@ -1209,7 +1276,7 @@ function onSubmitForm(e){
   var call = F.edit ? api('update', {id:F.edit.id, fromClasse:F.edit.classe, student:st, photo:F.photo}) : api('add', {student:st, photo:F.photo});
   call.then(function(r){
     var s = r.student;
-    if (LIVE && F.photo && s.photo) photoCache[s.photo] = F.photo;
+    if (LIVE && F.photo && s.photo){ photoCache[s.photo] = F.photo; var m = {}; m[s.photo] = F.photo; PhotoDB.put(m); }
     if (F.edit){
       var i = S.students.findIndex(function(x){ return x.id === s.id; });
       if (i >= 0 && S.students[i].classe === s.classe) S.students[i] = s;
@@ -1437,6 +1504,9 @@ function wire(){
   if (!LIVE){ $('#demo-pill').hidden = false; $('#demo-box').hidden = false; $('#pin-hint').hidden = false; }
 
   $('#keypad').addEventListener('click', function(e){ var b = e.target.closest('[data-k]'); if (b) pressKey(b.getAttribute('data-k')); });
+  // iPhone : bloque le zoom à deux doigts (Safari ignore parfois « user-scalable=no »)
+  ['gesturestart', 'gesturechange', 'gestureend'].forEach(function(ev){ document.addEventListener(ev, function(e){ e.preventDefault(); }, {passive:false}); });
+  document.addEventListener('touchmove', function(e){ if (e.touches && e.touches.length > 1) e.preventDefault(); }, {passive:false});
 
   $('#theme-btn').addEventListener('click', toggleTheme);
   $('#user-chip').addEventListener('click', openUser);

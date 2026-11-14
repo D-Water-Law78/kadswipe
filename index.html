@@ -169,6 +169,8 @@ a{color:inherit;text-decoration:none}
 .cc-status svg{width:15px;height:15px;flex:none}
 .cc-status.todo{color:var(--lv)}
 .cc-status.done{background:var(--ok-soft);color:var(--ok)}
+.cc-status.pending{animation:pend 1.4s ease-in-out infinite}
+@keyframes pend{50%{opacity:.55}}
 .skel{opacity:.55}
 .section-label{font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:22px 2px 10px}
 .weeks{display:grid;gap:10px;padding:14px 12px 12px;border-radius:var(--r);background:var(--surface);border:1px solid var(--line);width:100%}
@@ -896,10 +898,34 @@ function show(v){
   S.view = v;
   var sc = $('#v-' + v + ' .scroll'); if (sc) sc.scrollTop = 0;
 }
+/* ---------- Mémoire du téléphone : appels de chaque mercredi, présences, appels en attente d'envoi ---------- */
+var Days = store.get('kad-days', {});        // { '2026-11-18': { Maternelle:{par,heure,presents,total}, … } }
+var StCache = store.get('kad-st', {});       // { '2026-11-18|Maternelle': { idÉlève:'P'|'A', … } }
+var Outbox = store.get('kad-outbox', []);    // appels pas encore confirmés par Google
+function saveDay(date, today){
+  Days[date] = today || {};
+  var keys = Object.keys(Days).sort();
+  while (keys.length > 30) delete Days[keys.shift()];
+  store.set('kad-days', Days);
+}
+function saveSt(date, classe, st){
+  StCache[date + '|' + classe] = st;
+  var keys = Object.keys(StCache).sort();
+  while (keys.length > 40) delete StCache[keys.shift()];
+  store.set('kad-st', StCache);
+}
+/* Les appels envoyés depuis ce téléphone mais pas encore confirmés restent affichés comme faits. */
+function withPending(date, today){
+  var out = Object.assign({}, today || {});
+  Outbox.forEach(function(o){ if (o.date === date) out[o.classe] = o.meta; });
+  return out;
+}
 function refresh(){
   var session = S.session;
   return api('home', {date:session}).then(function(r){
-    S.students = r.students || []; S.removed = r.removed || []; S.today = r.today || {};
+    S.students = r.students || []; S.removed = r.removed || [];
+    saveDay(session, r.today || {});
+    if (session === S.session){ S.today = withPending(session, r.today); S.todayLoading = false; }   // on a pu changer de mercredi entre-temps
     S.recent = r.recent || []; S.links = r.links || null; S.loaded = true;
     // Copie gardée sur le téléphone : l'appli s'affiche tout de suite à la prochaine ouverture
     if (LIVE) store.set('kad-cache', {students:S.students, removed:S.removed, recent:S.recent, links:S.links, session:session, today:S.today});
@@ -911,7 +937,7 @@ function loadCached(){
   var c = store.get('kad-cache', null);
   if (!c || !c.students) return;
   S.students = c.students; S.removed = c.removed || []; S.recent = c.recent || []; S.links = c.links || null;
-  S.today = c.session === S.session ? (c.today || {}) : {};
+  S.today = withPending(S.session, Days[S.session] || (c.session === S.session ? c.today : {}));
   S.loaded = true;
   prefetchPhotos();
 }
@@ -924,22 +950,76 @@ function redrawCurrent(){
 }
 var lastSync = 0, syncing = false;
 function sync(){
-  if (syncing) return Promise.resolve();
-  syncing = true;
-  return refresh().then(function(){ lastSync = Date.now(); redrawCurrent(); })
+  if (syncing === S.session) return Promise.resolve();   // déjà en cours pour ce mercredi
+  syncing = S.session;
+  return refresh().then(function(){ lastSync = Date.now(); redrawCurrent(); afterSync(); })
     .then(function(){ syncing = false; }, function(e){ syncing = false; throw e; });
 }
 function goHome(){
   loadCached();
   show('home'); renderHome();
+  flushOutbox();
   sync().catch(handleErr);
 }
 /* L'appli revient au premier plan (iPhone : elle n'est pas rechargée) : on redemande la liste à Google. */
 document.addEventListener('visibilitychange', function(){
   if (document.visibilityState !== 'visible' || !S.pin || !LIVE) return;
+  flushOutbox();
   if (Date.now() - lastSync < 15000) return;
   sync().catch(function(){});
 });
+window.addEventListener('online', function(){ if (S.pin) flushOutbox(); });
+
+/* Après chaque mise à jour : on prépare en arrière-plan, l'un après l'autre,
+   - les étiquettes des derniers mercredis (les flèches s'affichent alors tout de suite),
+   - les présences des classes déjà faites (rouvrir un appel est alors immédiat). */
+var bgBusy = false, bgDone = {};
+function afterSync(){
+  if (!LIVE || bgBusy) return;
+  var jobs = [];
+  var d = defaultSession();
+  for (var i = 0; i < 4; i++){ var w = addDays(d, -7 * i); if (w !== S.session && !bgDone['d' + w]) jobs.push({day:w}); }
+  [S.session].concat(Object.keys(Days).sort().reverse().slice(0, 4)).forEach(function(date){
+    Object.keys(Days[date] || {}).forEach(function(c){
+      var k = date + '|' + c;
+      if (!StCache[k] && !bgDone['s' + k]) jobs.push({date:date, classe:c});
+    });
+  });
+  if (!jobs.length) return;
+  bgBusy = true;
+  (function next(){
+    var j = jobs.shift();
+    if (!S.pin){ bgBusy = false; return; }
+    if (!j){ bgBusy = false; afterSync(); return; }   // les mercredis chargés peuvent révéler des classes déjà faites
+    var p;
+    if (j.day){ bgDone['d' + j.day] = 1; p = api('home', {date:j.day}).then(function(r){ saveDay(j.day, r.today || {}); }); }
+    else { bgDone['s' + j.date + '|' + j.classe] = 1; p = api('todayStatuses', {classe:j.classe, date:j.date}).then(function(r){ saveSt(j.date, j.classe, r.statuses || {}); }); }
+    p.catch(function(){}).then(next);
+  })();
+}
+
+/* ---------- Envoi des appels : l'écran confirme tout de suite, Google est prévenu en arrière-plan ---------- */
+var flushing = false, flushTimer = null;
+function saveOutbox(){ store.set('kad-outbox', Outbox); }
+function flushOutbox(){
+  if (!LIVE || flushing || !Outbox.length || !S.pin) return;
+  flushing = true; clearTimeout(flushTimer);
+  var o = Outbox[0];
+  api('submit', {classe:o.classe, date:o.date, statuses:o.statuses}).then(function(r){
+    Outbox = Outbox.filter(function(x){ return x !== o; }); saveOutbox();
+    var meta = {par:S.name, heure:r.heure, presents:r.presents, total:r.presents + r.absents};
+    var day = Object.assign({}, Days[o.date] || {}); day[o.classe] = meta; saveDay(o.date, day);
+    if (o.date === S.session) S.today = withPending(o.date, day);
+    if (S.view === 'done' && DoneFor === o.id) $('#done-sub').textContent = 'Enregistré dans « ' + r.sheet + ' » et dans « Récap des appels ».';
+    if (S.view === 'home') renderHome();
+    flushing = false; flushOutbox();
+  }, function(e){
+    flushing = false;
+    if (/code incorrect/i.test((e && e.message) || '')) return;           // code changé : on gardera l'appel jusqu'à la reconnexion
+    if (S.view === 'done' && DoneFor === o.id) $('#done-sub').textContent = 'Pas encore arrivé dans le Google Sheet (réseau). L’appli réessaie toute seule, l’appel est gardé sur ce téléphone.';
+    flushTimer = setTimeout(flushOutbox, 8000);
+  });
+}
 
 /* ---------- Connexion : chaque serviteur a son code personnel ---------- */
 var pinBuf = '';
@@ -979,6 +1059,7 @@ function lock(msg){
   for (var k in photoCache) delete photoCache[k];
   for (var q in pendingPh) delete pendingPh[q];
   phQueue = []; phTries = {};
+  Days = {}; StCache = {}; bgDone = {}; store.del('kad-days'); store.del('kad-st');
   S.pin = ''; S.name = ''; S.loaded = false; S.students = []; S.removed = [];
   startLogin(msg);
 }
@@ -990,7 +1071,10 @@ function openUser(){
     function(sh, close){
       sh.addEventListener('click', function(e){
         var b = e.target.closest('[data-a]'); if (!b) return; close();
-        if (b.getAttribute('data-a') === 'lock') lock();
+        if (b.getAttribute('data-a') !== 'lock') return;
+        // un appel pas encore arrivé dans le Google Sheet serait perdu : on attend qu'il parte
+        if (Outbox.length){ flushOutbox(); toast('Un appel est encore en train de partir vers le Google Sheet. Réessaie dans quelques secondes.', {type:'err', ms:4500}); return; }
+        lock();
       });
     });
 }
@@ -1022,8 +1106,11 @@ function renderHome(){
     var t = S.today[c.key];
     var faces = list.slice(0, 3).map(function(s){ keys.push(s.photo); return avatar(s, 28); }).join('');
     var status = t
-      ? '<span class="cc-status done">' + I.check + '<span>' + t.presents + '/' + t.total + ' présents · ' + esc((t.par || '').split(' ')[0]) + ' ' + esc(t.heure || '') + '</span></span>'
-      : '<span class="cc-status todo"><span>Faire l’appel</span>' + I.arrow + '</span>';
+      ? '<span class="cc-status done' + (t.pending ? ' pending' : '') + '">' + I.check + '<span>' + t.presents + '/' + t.total + ' présents · ' +
+        (t.pending ? 'envoi…' : esc((t.par || '').split(' ')[0]) + ' ' + esc(t.heure || '')) + '</span></span>'
+      : S.todayLoading
+        ? '<span class="cc-status"><span>Chargement…</span></span>'
+        : '<span class="cc-status todo"><span>Faire l’appel</span>' + I.arrow + '</span>';
     return '<button class="class-card lv-' + c.lv + '" data-classe="' + esc(c.key) + '"><span class="cc-head"><span class="cc-badge">' + c.letter + '</span><span class="faces">' + faces + '</span></span>' +
       '<span><span class="cc-name">' + c.key + '</span><span class="cc-count">' + plural(list.length, 'élève') + '</span></span>' + status + '</button>';
   }).join('');
@@ -1038,16 +1125,38 @@ function renderHome(){
 function moveSession(k){
   var nx = addDays(S.session, 7 * k);
   if (nx > defaultSession()) return;
-  S.session = nx; S.today = {}; renderSession();
-  refresh().then(renderHome).catch(handleErr);
+  // Affichage immédiat depuis la mémoire du téléphone, puis vérification discrète auprès de Google
+  S.session = nx;
+  var known = LIVE ? Days[nx] : null;
+  S.today = withPending(nx, known || {}); S.todayLoading = LIVE && !known;
+  renderHome();
+  if (LIVE) sync().catch(function(e){ if (S.todayLoading){ S.todayLoading = false; renderHome(); } handleErr(e); });
+  else refresh().then(renderHome).catch(handleErr);
 }
 function openClass(classe){
   var list = S.students.filter(function(s){ return s.classe === classe; });
   if (!list.length){ toast('Aucun élève en ' + classe + '. Ajoutes-en dans l’onglet Élèves.'); return; }
+  if (S.todayLoading){ toast('Un instant, je regarde si l’appel de ce mercredi est déjà fait…'); return; }
   loadPhotos(list.map(function(s){ return s.photo; }));
   var t = S.today[classe];
   if (t){
-    api('todayStatuses', {classe:classe, date:S.session}).then(function(r){ startRecap(classe, list, r.statuses || {}, t, false); }).catch(handleErr);
+    var date = S.session, key = date + '|' + classe;
+    var pend = Outbox.filter(function(o){ return o.date === date && o.classe === classe; })[0];
+    var local = pend ? pend.statuses : (LIVE ? StCache[key] : null);
+    if (local){
+      // présences déjà sur le téléphone : le récap s'ouvre tout de suite, puis on vérifie auprès de Google
+      startRecap(classe, list, local, t, false);
+      if (!pend) api('todayStatuses', {classe:classe, date:date}).then(function(r){
+        var st = r.statuses || {}; saveSt(date, classe, st);
+        if (S.view === 'recap' && R.classe === classe && !R.touched && S.session === date){ startRecap(classe, list, st, t, false); }
+      }).catch(function(){});
+      return;
+    }
+    toast('Chargement de l’appel…', {ms:8000});
+    api('todayStatuses', {classe:classe, date:date}).then(function(r){
+      hideToast(); saveSt(date, classe, r.statuses || {});
+      startRecap(classe, list, r.statuses || {}, t, false);
+    }).catch(handleErr);
     return;
   }
   startSwipe(classe, list);
@@ -1175,12 +1284,32 @@ function renderRecap(){
 function toggleTile(id){
   var s = R.list.find(function(x){ return x.id === id; }); if (!s) return;
   R.st[id] = R.st[id] === 'P' ? 'A' : 'P';
+  R.touched = true;
   buzz(8);
   toast(fullName(s) + (R.st[id] === 'P' ? ' passe présent' : ' passe absent'));
   renderRecap();
 }
+var DoneFor = null;
 function sendRecap(){
   if (R.sending) return;
+  if (LIVE){
+    // L'appel est gardé sur le téléphone puis envoyé à Google en arrière-plan : l'écran confirme tout de suite.
+    var p = 0, a = 0, st = Object.assign({}, R.st);
+    Object.keys(st).forEach(function(id){ if (st[id] === 'P') p++; else a++; });
+    var now = new Date(), date = S.session;
+    var o = {id:'o' + now.getTime(), date:date, classe:R.classe, statuses:st,
+             meta:{par:S.name, heure:pad(now.getHours()) + ':' + pad(now.getMinutes()), presents:p, total:p + a, pending:true}};
+    Outbox = Outbox.filter(function(x){ return !(x.date === date && x.classe === R.classe); }).concat([o]);   // un nouvel envoi remplace l'ancien
+    saveOutbox(); saveSt(date, R.classe, st);
+    S.today = withPending(date, Days[date] || S.today);
+    DoneFor = o.id;
+    $('#done-ring').innerHTML = I.check;
+    $('#done-text').textContent = fmtWed(date) + ' · ' + R.classe + ' : ' + plural(p, 'présent') + ', ' + plural(a, 'absent') + '.';
+    $('#done-sub').textContent = 'Envoi au Google Sheet en cours… Tu peux continuer, il part tout seul.';
+    hideToast(); show('done'); buzz(12);
+    flushOutbox();
+    return;
+  }
   R.sending = true; renderRecap();
   api('submit', {classe:R.classe, date:S.session, statuses:R.st}).then(function(r){
     S.today[R.classe] = {par:S.name, heure:r.heure, presents:r.presents, total:r.presents + r.absents};

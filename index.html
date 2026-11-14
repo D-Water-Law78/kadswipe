@@ -694,15 +694,22 @@ var PhotoDB = (function(){
   var dbp = null;
   function open(){
     if (!dbp) dbp = new Promise(function(res){
+      var done = false;
+      function fin(db){ if (!done){ done = true; res(db); } }
+      // iPhone : il arrive que l'ouverture de la mémoire ne réponde jamais. Au bout de 2 s on passe par Internet.
+      setTimeout(function(){ fin(null); }, 2000);
       try {
         var r = indexedDB.open('kadswipe', 1);
         r.onupgradeneeded = function(){ r.result.createObjectStore('photos'); };
-        r.onsuccess = function(){ res(r.result); };
-        r.onerror = function(){ res(null); };
-      } catch(e){ res(null); }
-    });
+        r.onsuccess = function(){ fin(r.result); };
+        r.onerror = function(){ fin(null); };
+        r.onblocked = function(){ fin(null); };
+      } catch(e){ fin(null); }
+    }).then(function(db){ if (!db) dbp = null; return db; });   // pas de mémoire cette fois : on réessaiera plus tard
     return dbp;
   }
+  // Demande au téléphone de ne jamais effacer cette mémoire tout seul
+  try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(function(){}); } catch(e){}
   return {
     getMany: function(keys){
       return open().then(function(db){
@@ -712,7 +719,7 @@ var PhotoDB = (function(){
           try {
             var tx = db.transaction('photos', 'readonly'), st = tx.objectStore('photos');
             keys.forEach(function(k){ var q = st.get(k); q.onsuccess = function(){ if (q.result) out[k] = q.result; }; });
-            tx.oncomplete = function(){ res(out); }; tx.onerror = function(){ res(out); };
+            tx.oncomplete = function(){ res(out); }; tx.onerror = function(){ res(out); }; tx.onabort = function(){ res(out); };
           } catch(e){ res(out); }
         });
       });
@@ -726,28 +733,69 @@ var PhotoDB = (function(){
     clear: function(){ open().then(function(db){ if (db) try { db.transaction('photos', 'readwrite').objectStore('photos').clear(); } catch(e){} }); }
   };
 })();
-function loadPhotos(keys){
+/* File d'attente des photos : d'abord la mémoire du téléphone, puis Google par paquets de 8 (2 paquets à la fois).
+   Les photos de l'écran affiché passent devant ; une photo qui n'arrive pas est redemandée toute seule. */
+var phQueue = [], phBusy = 0, phTries = {};
+function loadPhotos(keys, background){
   if (!LIVE) return;
   var seen = {}, miss = [];
-  keys.forEach(function(k){ if (k && !seen[k] && !(k in photoCache) && !pendingPh[k]) { seen[k] = 1; miss.push(k); } });
-  if (!miss.length) return;
+  keys.forEach(function(k){ if (k && !seen[k] && !photoCache[k] && !pendingPh[k]) { seen[k] = 1; miss.push(k); } });
+  if (!background){
+    // une photo déjà en attente mais pour l'arrière-plan : on la fait passer devant
+    var front = keys.filter(function(k){ return k && phQueue.indexOf(k) >= 0; });
+    if (front.length) phQueue = front.concat(phQueue.filter(function(k){ return front.indexOf(k) < 0; }));
+  }
+  if (!miss.length){ applyPhotos(); return; }
   miss.forEach(function(k){ pendingPh[k] = 1; });
   PhotoDB.getMany(miss).then(function(local){
     var net = [];
     miss.forEach(function(k){ if (local[k]){ photoCache[k] = local[k]; delete pendingPh[k]; } else net.push(k); });
     applyPhotos();
-    for (var i = 0; i < net.length; i += 4) (function(chunk){
-      api('photos', {ids: chunk}).then(function(map){
-        var keep = {};
-        chunk.forEach(function(k){ delete pendingPh[k]; photoCache[k] = (map && map[k]) || null; if (photoCache[k]) keep[k] = photoCache[k]; });
-        PhotoDB.put(keep);
-        applyPhotos();
-      }).catch(function(){ chunk.forEach(function(k){ delete pendingPh[k]; }); });
-    })(net.slice(i, i+4));
+    if (!net.length) return;
+    phQueue = background ? phQueue.concat(net) : net.concat(phQueue);
+    pumpPhotos();
   });
 }
+function pumpPhotos(){
+  while (phBusy < 2 && phQueue.length){
+    var chunk = phQueue.splice(0, 8);
+    phBusy++;
+    (function(chunk){
+      api('photos', {ids: chunk}).then(function(map){
+        var keep = {}, again = [];
+        chunk.forEach(function(k){
+          var v = map && map[k];
+          if (v){ photoCache[k] = v; keep[k] = v; delete pendingPh[k]; }
+          else again.push(k);
+        });
+        PhotoDB.put(keep);
+        retryPhotos(again);
+      }, function(){ retryPhotos(chunk); })
+      .then(function(){ phBusy--; applyPhotos(); pumpPhotos(); });
+    })(chunk);
+  }
+}
+function retryPhotos(keys){
+  var later = keys.filter(function(k){
+    phTries[k] = (phTries[k] || 0) + 1;
+    if (phTries[k] > 3){ delete pendingPh[k]; return false; }   // photo introuvable : on la redemandera à la prochaine ouverture
+    return true;
+  });
+  if (!later.length) return;
+  var wait = 1500 * Math.max.apply(null, later.map(function(k){ return phTries[k]; }));
+  setTimeout(function(){ phQueue = phQueue.concat(later); pumpPhotos(); }, wait);
+}
+/* Dès que la liste des élèves est connue : toutes les photos sont préparées en arrière-plan,
+   pour que chaque classe s'affiche complète, tout de suite. */
+function prefetchPhotos(){
+  if (!LIVE) return;
+  loadPhotos(S.students.concat(S.removed).map(function(s){ return s.photo; }), true);
+}
 function applyPhotos(){
-  $$('img[data-ph]:not([src])').forEach(function(img){ var v = photoCache[img.getAttribute('data-ph')]; if (v) img.src = v; });
+  $$('img[data-ph]').forEach(function(img){
+    var v = photoCache[img.getAttribute('data-ph')];
+    if (v && img.getAttribute('src') !== v) img.src = v;
+  });
 }
 
 /* ---------- Serveur (Google Apps Script) ou démo locale ---------- */
@@ -855,6 +903,7 @@ function refresh(){
     S.recent = r.recent || []; S.links = r.links || null; S.loaded = true;
     // Copie gardée sur le téléphone : l'appli s'affiche tout de suite à la prochaine ouverture
     if (LIVE) store.set('kad-cache', {students:S.students, removed:S.removed, recent:S.recent, links:S.links, session:session, today:S.today});
+    prefetchPhotos();
   });
 }
 function loadCached(){
@@ -864,6 +913,7 @@ function loadCached(){
   S.students = c.students; S.removed = c.removed || []; S.recent = c.recent || []; S.links = c.links || null;
   S.today = c.session === S.session ? (c.today || {}) : {};
   S.loaded = true;
+  prefetchPhotos();
 }
 function goHome(){
   loadCached();
@@ -907,6 +957,8 @@ function lock(msg){
   // Déconnexion : on efface aussi la copie des élèves et des photos gardée sur ce téléphone
   store.del('kad-auth'); store.del('kad-cache'); if (LIVE) PhotoDB.clear();
   for (var k in photoCache) delete photoCache[k];
+  for (var q in pendingPh) delete pendingPh[q];
+  phQueue = []; phTries = {};
   S.pin = ''; S.name = ''; S.loaded = false; S.students = []; S.removed = [];
   startLogin(msg);
 }
